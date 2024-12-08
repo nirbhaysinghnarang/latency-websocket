@@ -1,6 +1,11 @@
 import asyncio
 import websockets
 import logging
+
+
+from healthcheck_ws import HealthCheckWebsocket
+
+
 logging.basicConfig(level=logging.INFO) 
 
 class LatencyAwareWebsocket:
@@ -13,7 +18,10 @@ class LatencyAwareWebsocket:
         window_sz: int = 10,
         min_bad_count: int = 7,
         ping_interval: int = 1,
-        ping_timeout: int = 200
+        ping_timeout: int = 200,
+        connection_timeout: int = 5,
+        
+        maintain_healthcheck=True
     ):
         self.uri = uri
         self.logger = logging.getLogger(__name__)
@@ -24,20 +32,30 @@ class LatencyAwareWebsocket:
         self.min_bad_count = min_bad_count
         self.ping_interval = ping_interval
         self.ping_timeout = ping_timeout
+        self.connection_timeout = connection_timeout
+        self.maintain_healthcheck = maintain_healthcheck
 
         self.retry_attempts = 0
         self.is_connected = False
         self.bandwidth_window = []
-
+        
+        self.healthcheck_socket = HealthCheckWebsocket(
+            uri=self.uri,
+            ping_interval=self.ping_interval,
+            ping_timeout=self.ping_timeout,
+            on_good_latency=self.on_detect_good_latency
+        )
+        
     async def connect(self):
         try:
-            self.connection = await websockets.connect(self.uri)
+            self.connection = await asyncio.wait_for(websockets.connect(self.uri), timeout=self.connection_timeout)
             self.logger.info("Connected to WebSocket server")
             self.retry_attempts = 0
             self.is_connected = True
             
-            asyncio.create_task(self.ping_loop())
-            await self.listen()  
+            self.ping_task = asyncio.create_task(self.ping_loop())
+            self.listen_task = asyncio.create_task(self.listen())
+            await self.listen_task
 
         except asyncio.TimeoutError:
             self.log("Connection Timed Out")
@@ -53,6 +71,7 @@ class LatencyAwareWebsocket:
             await self.handle_retry()
 
     async def listen(self):
+        if not self.is_connected:   return
         try:
             async for message in self.connection:
                 self.log(f"Received message: {message}")
@@ -74,16 +93,47 @@ class LatencyAwareWebsocket:
             return
         if self.retry_connection and self.retry_attempts < self.max_retry_attempts:
             self.log("Attempting retry.")
+            await self.cleanup_tasks()
             self.retry_attempts += 1
             await self.connect()
             return
         self.log("Not retrying.")
+        
+        
+    async def cleanup_tasks(self):
+        
+        if hasattr(self, 'ping_task') and self.ping_task and not self.ping_task.done():
+            self.ping_task.cancel()
+            self.logger.info("Ping task cancelled")
+            try:
+                await self.ping_task
+            except asyncio.CancelledError:
+                self.logger.info("Ping task confirmed cancelled")
+
+        if hasattr(self, 'listen_task') and self.listen_task and not self.listen_task.done():
+            self.listen_task.cancel()
+            self.logger.info("Listen task cancelled")
+            try:
+                await self.listen_task
+            except asyncio.CancelledError:
+                self.logger.info("Listen task confirmed cancelled")
 
     async def close(self):
         if self.is_connected:
-            await self.connection.close()
+            try:
+                await asyncio.wait_for(self.connection.wait_closed(), timeout=2)
+            except asyncio.TimeoutError:
+                self.logger.info("Connection close timed out.")
+
             self.is_connected = False
             self.logger.info("Connection closed")
+            self.connection = None
+
+        await self.cleanup_tasks()
+        if getattr(self, 'maintain_healthcheck', False) and getattr(self, 'healthcheck_socket', None):
+            await self.healthcheck_socket.connect()
+
+            
 
     async def ping_pong(self):
         if not self.is_connected:
@@ -104,9 +154,15 @@ class LatencyAwareWebsocket:
 
     async def handle_bad_window(self):
         self.log("Handling bad window")
-        # If the window is bad, stop retrying and close.
         self.retry_connection = False
-        await self.close()
+        if self.is_connected:
+            await self.close()
+        
+        
+        
+        
+        
+        
 
     async def handle_new_latency(self, res: bool):
         self.log(f"Received latency result {res} ")
@@ -130,6 +186,22 @@ class LatencyAwareWebsocket:
 
     def log(self, message: str):
         self.logger.info(message)
+
+    def refresh_state(self):
+        self.retry_attempts = 0
+        self.is_connected = False
+        self.retry_connection = True
+        self.bandwidth_window = []
+        
+        
+    async def on_detect_good_latency(self):
+        self.refresh_state()
+        if self.healthcheck_socket:
+            await self.healthcheck_socket.terminate()
+            
+        await self.connect()
+        
+
 
 if __name__ == "__main__":
     async def main():
